@@ -1,350 +1,201 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>QQQ 择时策略信号灯</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-    <style>
-        body { font-family: "Microsoft YaHei", sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
-        .container { max-width: 1100px; margin: auto; }
-        .light { width: 180px; height: 180px; border-radius: 50%; margin: 20px auto; box-shadow: 0 0 30px rgba(0,0,0,0.8); display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: bold; }
-        .green { background: #22c55e; color: #000; animation: pulse 2s infinite; }
-        .red { background: #ef4444; color: #fff; }
-        .yellow { background: #eab308; color: #000; }
-        .gray { background: #64748b; color: #fff; }
-        .card { background: #1e2937; border-radius: 12px; padding: 20px; margin: 15px 0; }
-        button { background: #3b82f6; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; cursor: pointer; }
-        button:hover { background: #2563eb; }
-        .signal-text { font-size: 24px; font-weight: bold; text-align: center; margin: 10px 0; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1 style="text-align:center;">🚦 QQQ 中长线择时策略信号灯（优化版）</h1>
-        <p style="text-align:center;color:#94a3b8;">趋势过滤 + 超卖建仓 + 分步止盈 | 止盈阈值已优化（RSI>75 / 偏离15%）</p>
-        
-        <div class="card">
-            <button onclick="fetchAndRun()" style="width:100%; padding:15px; font-size:18px;">🔄 立即更新最新数据（每日必点）</button>
-        </div>
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from datetime import datetime
 
-        <div class="card" style="text-align:center;">
-            <div id="signalLight" class="light gray">加载中...</div>
-            <div id="signalText" class="signal-text">——</div>
-            <div id="detail" style="font-size:15px; line-height:1.6;"></div>
-        </div>
+st.set_page_config(page_title="QQQ 信号灯", layout="centered")
+st.title("🚦 QQQ 中长线择时策略信号灯（优化版）")
+st.markdown("**趋势过滤 + 超卖建仓 + 分步止盈** | 止盈阈值已优化（RSI>75 / 偏离15%）")
 
-        <div class="card">
-            <h3>📊 最新市场状态 & 策略信号</h3>
-            <div id="status" style="line-height:1.8;"></div>
-        </div>
+# ==================== 信号灯核心函数 ====================
+@st.cache_data(ttl=1800, show_spinner=False)  # 缓存30分钟
+def get_strategy_signal():
+    try:
+        # 使用最稳定的方式获取数据
+        ticker = yf.Ticker("QQQ")
+        df = ticker.history(period="max", auto_adjust=False, actions=False)
+        if df.empty or len(df) < 300:
+            return {"error": "数据下载失败，请稍后重试"}
 
-        <div class="card">
-            <canvas id="priceChart" height="120"></canvas>
-        </div>
+        df = df[['Close']].copy()
+        df.columns = ['close']
+        df = df.reset_index().rename(columns={'Date': 'date'})
 
-        <div class="card">
-            <p style="font-size:13px; color:#64748b; text-align:center;">
-                数据来源：Yahoo Finance | 策略最后更新：2026-03-26<br>
-                本工具纯前端运行，无需安装，数据每日自动更新
-            </p>
-        </div>
-    </div>
+        # 计算指标
+        df['MA200'] = df['close'].rolling(200).mean()
+        df['MA50'] = df['close'].rolling(50).mean()
+        df['MA20'] = df['close'].rolling(20).mean()
+        df['BB_lower'] = df['MA20'] - 2 * df['close'].rolling(20).std()
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
 
-    <script>
-        let priceChartInstance = null;
+        df = df.dropna().reset_index(drop=True)
+        if len(df) < 300:
+            return {"error": "数据不足"}
 
-        async function fetchAndRun() {
-            const light = document.getElementById('signalLight');
-            const text = document.getElementById('signalText');
-            light.className = 'light gray';
-            light.textContent = '获取数据...';
-            text.textContent = '正在拉取最新 QQQ 数据...';
+        # 策略回测（只为了得到当前持仓状态和今日信号）
+        cash = 100000.0
+        shares = 0.0
+        avg_entry = 0.0
+        last_buy_price = 0.0
+        add_stage = 0
+        today_action = "等待"
+        today_signal = "gray"
+        position_pct = 0
+        unrealized = 0.0
 
-            try {
-                // 使用 Yahoo Finance v8 chart API（公开可用）
-                const now = Math.floor(Date.now() / 1000);
-                const start = 1262304000; // 2010-01-01
-                const url = `https://query2.finance.yahoo.com/v8/finance/chart/QQQ?period1=${start}&period2=${now}&interval=1d`;
-                
-                const response = await fetch(url, {
-                    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-                });
-                const data = await response.json();
+        for i in range(len(df)):
+            row = df.iloc[i]
+            price = row['close']
+            ma200 = row['MA200']
+            ma50 = row['MA50']
+            rsi = row['RSI']
+            bb_lower = row['BB_lower']
+            ma20 = row['MA20']
+            current_equity = cash + shares * price
 
-                const result = data.chart.result[0];
-                const timestamps = result.timestamp;
-                const quotes = result.indicators.quote[0];
+            # 止损
+            if shares > 0:
+                if (avg_entry > 0 and price < avg_entry * 0.92) or price < ma200:
+                    cash += shares * price
+                    shares = 0.0
+                    avg_entry = 0.0
+                    last_buy_price = 0.0
+                    add_stage = 0
+                    if i == len(df) - 1:  # 今天触发
+                        today_action = "🔴 全仓止损"
+                        today_signal = "red"
+                    continue
 
-                // 构建数据
-                const df = [];
-                for (let i = 0; i < timestamps.length; i++) {
-                    df.push({
-                        date: new Date(timestamps[i] * 1000),
-                        close: quotes.close[i],
-                        high: quotes.high[i],
-                        low: quotes.low[i],
-                        open: quotes.open[i]
-                    });
-                }
+            # 止盈（优化后）
+            if shares > 0:
+                deviate = (price / ma50 - 1) if ma50 > 0 else 0
+                if rsi > 75 or deviate > 0.15:
+                    cash += shares * price
+                    shares = 0.0
+                    avg_entry = 0.0
+                    last_buy_price = 0.0
+                    add_stage = 0
+                    if i == len(df) - 1:
+                        today_action = "🔴 全仓止盈"
+                        today_signal = "red"
+                    continue
 
-                // 计算技术指标
-                const closes = df.map(d => d.close);
-                const ma200 = rollingMean(closes, 200);
-                const ma50 = rollingMean(closes, 50);
-                const ma20 = rollingMean(closes, 20);
-                const bbLower = bollingerLower(closes, 20, 2);
-                const rsi = calculateRSI(closes, 14);
+            trend_ok = price > ma200
+            oversold = (rsi <= 40) or (price <= bb_lower)
 
-                // 运行完整策略逻辑（与 Python 优化版完全一致）
-                const strategyResult = runStrategy(df, ma200, ma50, ma20, bbLower, rsi);
+            # 首次买入 30%
+            if trend_ok and oversold and shares == 0 and add_stage == 0:
+                buy_amount = min(0.3 * current_equity, cash)
+                if buy_amount > 0:
+                    shares += buy_amount / price
+                    cash -= buy_amount
+                    avg_entry = price
+                    last_buy_price = price
+                    add_stage = 1
+                    if i == len(df) - 1:
+                        today_action = "🟢 首次买入 30%"
+                        today_signal = "green"
 
-                // 显示信号灯
-                displaySignal(strategyResult, df[df.length-1]);
+            # 二次加仓（回调4%）
+            if shares > 0 and add_stage == 1 and price < last_buy_price * 0.96 and price > ma200:
+                buy_amount = min(0.3 * current_equity, cash)
+                if buy_amount > 0:
+                    buy_shares = buy_amount / price
+                    shares += buy_shares
+                    cash -= buy_amount
+                    avg_entry = (avg_entry * (shares - buy_shares) + price * buy_shares) / shares
+                    last_buy_price = price
+                    add_stage = 2
+                    if i == len(df) - 1:
+                        today_action = "🟢 加仓 30%（二次）"
+                        today_signal = "green"
 
-                // 画图
-                drawChart(df.slice(-400), strategyResult.signals); // 最近400天
+            # 三次加仓（反弹 > MA20）
+            if shares > 0 and add_stage == 2 and price > ma20:
+                buy_amount = min(0.4 * current_equity, cash)
+                if buy_amount > 0:
+                    buy_shares = buy_amount / price
+                    shares += buy_shares
+                    cash -= buy_amount
+                    avg_entry = (avg_entry * (shares - buy_shares) + price * buy_shares) / shares
+                    last_buy_price = price
+                    add_stage = 3
+                    if i == len(df) - 1:
+                        today_action = "🟢 加仓 40%（三次）"
+                        today_signal = "green"
 
-            } catch (e) {
-                console.error(e);
-                document.getElementById('signalText').innerHTML = '❌ 数据获取失败，请稍后重试或检查网络';
-            }
+        # 当前状态
+        last_price = df.iloc[-1]['close']
+        last_rsi = df.iloc[-1]['RSI']
+        last_ma200 = df.iloc[-1]['MA200']
+        trend_ok = last_price > last_ma200
+        position_pct = round((shares * last_price) / (cash + shares * last_price) * 100, 1) if shares > 0 else 0
+        unrealized = ((last_price - avg_entry) / avg_entry * 100) if shares > 0 and avg_entry > 0 else 0
+
+        # 如果当天没有新动作，但已经持仓 → 持仓观望
+        if today_signal == "gray" and position_pct > 0:
+            today_action = "🟡 持仓观望"
+            today_signal = "yellow"
+
+        return {
+            "today_action": today_action,
+            "today_signal": today_signal,
+            "last_price": last_price,
+            "last_rsi": last_rsi,
+            "trend_ok": trend_ok,
+            "position_pct": position_pct,
+            "unrealized": unrealized,
+            "date": df.iloc[-1]['date'].strftime("%Y-%m-%d")
         }
 
-        // ==================== 指标计算 ====================
-        function rollingMean(arr, window) {
-            const result = [];
-            for (let i = 0; i < arr.length; i++) {
-                if (i < window - 1) result.push(null);
-                else {
-                    const slice = arr.slice(i - window + 1, i + 1);
-                    result.push(slice.reduce((a, b) => a + b, 0) / window);
-                }
-            }
-            return result;
-        }
+    except Exception as e:
+        return {"error": str(e)}
 
-        function bollingerLower(arr, window, k) {
-            const result = [];
-            for (let i = 0; i < arr.length; i++) {
-                if (i < window - 1) result.push(null);
-                else {
-                    const slice = arr.slice(i - window + 1, i + 1);
-                    const mean = slice.reduce((a, b) => a + b, 0) / window;
-                    const std = Math.sqrt(slice.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / window);
-                    result.push(mean - k * std);
-                }
-            }
-            return result;
-        }
+# ==================== 主界面 ====================
+if st.button("🔄 更新最新数据（每日必点）", type="primary", use_container_width=True):
+    st.rerun()
 
-        function calculateRSI(closes, period) {
-            const rsi = [];
-            let gain = 0, loss = 0;
-            for (let i = 1; i < closes.length; i++) {
-                const change = closes[i] - closes[i-1];
-                if (i <= period) {
-                    if (change > 0) gain += change;
-                    else loss -= change;
-                    if (i === period) {
-                        const avgGain = gain / period;
-                        const avgLoss = loss / period;
-                        const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-                        rsi.push(100 - (100 / (1 + rs)));
-                    } else rsi.push(null);
-                } else {
-                    const change = closes[i] - closes[i-1];
-                    const newGain = change > 0 ? change : 0;
-                    const newLoss = change < 0 ? -change : 0;
-                    gain = (gain * (period-1) + newGain) / period;
-                    loss = (loss * (period-1) + newLoss) / period;
-                    const rs = loss === 0 ? 100 : gain / loss;
-                    rsi.push(100 - (100 / (1 + rs)));
-                }
-            }
-            return [null, ...rsi];
-        }
+signal = get_strategy_signal()
 
-        // ==================== 策略核心逻辑（与优化版完全一致） ====================
-        function runStrategy(df, ma200, ma50, ma20, bbLower, rsi) {
-            let cash = 100000;
-            let shares = 0;
-            let avgEntry = 0;
-            let lastBuyPrice = 0;
-            let addStage = 0;
-            let entryDate = null;
-            let signals = [];
+if "error" in signal:
+    st.error(f"❌ {signal['error']}")
+    st.stop()
 
-            for (let i = 200; i < df.length; i++) {  // 跳过 warmup
-                const price = df[i].close;
-                const currentMA200 = ma200[i];
-                const currentMA50 = ma50[i];
-                const currentMA20 = ma20[i];
-                const currentRSI = rsi[i];
-                const currentBBLower = bbLower[i];
+# 大信号灯
+color_map = {"green": "🟢", "yellow": "🟡", "red": "🔴", "gray": "⚪"}
+st.markdown(f"""
+<div style="text-align:center; margin:30px 0;">
+    <div style="font-size:120px; line-height:1;">{color_map[signal['today_signal']]}</div>
+</div>
+""", unsafe_allow_html=True)
 
-                // 止损
-                if (shares > 0) {
-                    if ((avgEntry > 0 && price < avgEntry * 0.92) || price < currentMA200) {
-                        cash += shares * price;
-                        shares = 0; avgEntry = 0; lastBuyPrice = 0; addStage = 0;
-                        signals.push({date: df[i].date, action: 'stoploss'});
-                        continue;
-                    }
-                }
+st.markdown(f"<h2 style='text-align:center; color:#22c55e;'>{signal['today_action']}</h2>", unsafe_allow_html=True)
 
-                // 止盈（优化后：75 / 15%）
-                if (shares > 0) {
-                    const deviate = currentMA50 ? (price / currentMA50 - 1) : 0;
-                    if (currentRSI > 75 || deviate > 0.15) {
-                        cash += shares * price;
-                        shares = 0; avgEntry = 0; lastBuyPrice = 0; addStage = 0;
-                        signals.push({date: df[i].date, action: 'takeprofit'});
-                        continue;
-                    }
-                }
+# 详细信息
+col1, col2, col3 = st.columns(3)
+col1.metric("最新收盘价", f"${signal['last_price']:.2f}")
+col2.metric("RSI(14)", f"{signal['last_rsi']:.1f}")
+col3.metric("趋势状态", "✅ MA200 之上" if signal['trend_ok'] else "❌ 已破位")
 
-                const trendOk = price > currentMA200;
-                const oversold = (currentRSI <= 40) || (price <= currentBBLower);
+st.markdown("---")
+st.write(f"**当前持仓**：{signal['position_pct']}%　|　**未实现盈亏**：{signal['unrealized']:.2f}%")
+st.caption(f"数据日期：{signal['date']}（实时更新）")
 
-                // 首次建仓
-                if (trendOk && oversold && shares === 0 && addStage === 0) {
-                    const buyAmount = Math.min(0.3 * (cash + shares * price), cash);
-                    if (buyAmount > 0) {
-                        const buyShares = buyAmount / price;
-                        shares += buyShares;
-                        cash -= buyAmount;
-                        avgEntry = price;
-                        lastBuyPrice = price;
-                        addStage = 1;
-                        signals.push({date: df[i].date, action: 'buy30'});
-                    }
-                }
+# 小 K 线图
+st.subheader("最近 120 天 K 线")
+ticker = yf.Ticker("QQQ")
+hist = ticker.history(period="6mo")
+fig = go.Figure(data=[go.Candlestick(x=hist.index,
+                open=hist['Open'], high=hist['High'],
+                low=hist['Low'], close=hist['Close'])])
+fig.update_layout(height=400, template="plotly_dark", margin=dict(l=0,r=0,t=0,b=0))
+st.plotly_chart(fig, use_container_width=True)
 
-                // 二次加仓（回调4%）
-                if (shares > 0 && addStage === 1 && price < lastBuyPrice * 0.96 && price > currentMA200) {
-                    const buyAmount = Math.min(0.3 * (cash + shares * price), cash);
-                    if (buyAmount > 0) {
-                        const buyShares = buyAmount / price;
-                        shares += buyShares;
-                        cash -= buyAmount;
-                        avgEntry = (avgEntry * (shares - buyShares) + price * buyShares) / shares;
-                        lastBuyPrice = price;
-                        addStage = 2;
-                        signals.push({date: df[i].date, action: 'buy30add'});
-                    }
-                }
-
-                // 三次加仓（反弹 > MA20）
-                if (shares > 0 && addStage === 2 && price > currentMA20) {
-                    const buyAmount = Math.min(0.4 * (cash + shares * price), cash);
-                    if (buyAmount > 0) {
-                        const buyShares = buyAmount / price;
-                        shares += buyShares;
-                        cash -= buyAmount;
-                        avgEntry = (avgEntry * (shares - buyShares) + price * buyShares) / shares;
-                        lastBuyPrice = price;
-                        addStage = 3;
-                        signals.push({date: df[i].date, action: 'buy40'});
-                    }
-                }
-            }
-
-            const lastPrice = df[df.length-1].close;
-            const unrealized = shares > 0 ? (lastPrice - avgEntry) / avgEntry * 100 : 0;
-            const positionPct = shares > 0 ? Math.round((shares * lastPrice) / (cash + shares * lastPrice) * 100) : 0;
-
-            return {
-                positionPct,
-                avgEntry: avgEntry || 0,
-                unrealized,
-                lastPrice,
-                lastRSI: rsi[rsi.length-1],
-                lastMA200: ma200[ma200.length-1],
-                trendOk: df[df.length-1].close > ma200[ma200.length-1],
-                signals
-            };
-        }
-
-        function displaySignal(result, lastRow) {
-            const light = document.getElementById('signalLight');
-            const text = document.getElementById('signalText');
-            const detail = document.getElementById('detail');
-            const status = document.getElementById('status');
-
-            let colorClass = 'gray';
-            let signalMsg = '——';
-            let action = '';
-
-            if (result.positionPct === 0) {
-                if (result.trendOk && (result.lastRSI <= 40 || lastRow.close <= /* BB lower approx */ lastRow.close * 0.95)) {
-                    colorClass = 'green';
-                    signalMsg = '🟢 首次买入信号';
-                    action = '建议立即买入 30% 仓位';
-                } else {
-                    colorClass = 'gray';
-                    signalMsg = '⚪ 空仓等待';
-                    action = '等待超卖信号';
-                }
-            } else {
-                if (result.lastRSI > 75 || (result.avgEntry > 0 && (lastRow.close / result.avgEntry - 1) > 0.15)) {
-                    colorClass = 'red';
-                    signalMsg = '🔴 止盈信号';
-                    action = '建议全仓止盈';
-                } else {
-                    colorClass = 'yellow';
-                    signalMsg = '🟡 持仓观望';
-                    action = `当前持仓 ${result.positionPct}% | 未实现盈亏 ${result.unrealized.toFixed(2)}%`;
-                }
-            }
-
-            light.className = `light ${colorClass}`;
-            light.textContent = signalMsg;
-            text.textContent = action;
-
-            detail.innerHTML = `
-                最新收盘价：<b>${lastRow.close.toFixed(2)}</b><br>
-                RSI(14)：<b>${result.lastRSI ? result.lastRSI.toFixed(1) : '—'}</b>　|　
-                趋势：<b>${result.trendOk ? '✅ MA200 之上（牛市）' : '❌ 破位'}</b><br>
-                当前策略状态：<b>${result.positionPct > 0 ? '已持仓' : '空仓'}</b>
-            `;
-
-            status.innerHTML = `
-                📍 最新价格：${lastRow.close.toFixed(2)} USD<br>
-                📈 200日均线：${result.lastMA200 ? result.lastMA200.toFixed(2) : '—'}<br>
-                📉 持仓比例：${result.positionPct}%<br>
-                💰 未实现盈亏：${result.unrealized.toFixed(2)}%
-            `;
-        }
-
-        function drawChart(dfSlice, signals) {
-            const ctx = document.getElementById('priceChart');
-            if (priceChartInstance) priceChartInstance.destroy();
-            
-            priceChartInstance = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: dfSlice.map(d => d.date.toISOString().slice(5,10)),
-                    datasets: [{
-                        label: 'QQQ 收盘价',
-                        data: dfSlice.map(d => d.close),
-                        borderColor: '#22c55e',
-                        borderWidth: 2,
-                        tension: 0.1,
-                        pointRadius: 0
-                    }]
-                },
-                options: {
-                    plugins: { legend: { display: false } },
-                    scales: { y: { grid: { color: '#334155' } }, x: { grid: { color: '#334155' } } }
-                }
-            });
-        }
-
-        // 页面加载自动更新一次
-        window.onload = () => {
-            fetchAndRun();
-        };
-    </script>
-</body>
-</html>
+st.success("✅ 信号灯已就绪！每天打开网页点一次「更新最新数据」即可获得今日交易建议。")
+st.caption("策略逻辑与之前 Python 优化版完全一致 | 如需增加分步止盈提示、VIX过滤器、手机推送，请告诉我")
