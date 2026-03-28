@@ -5,38 +5,30 @@ import numpy as np
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="QQQ 信号灯", layout="centered")
-st.title("🚦 QQQ 中长线择时策略信号灯（VIX>25 + 分步止盈最终稳定版）")
+st.title("🚦 QQQ 中长线择时策略信号灯（VIX>25 + 分步止盈 最终重构版）")
 st.markdown("**趋势过滤 + 超卖建仓 + VIX>25过滤 + 分步止盈（30%-30%-40%）**")
 
-@st.cache_data(ttl=3600, show_spinner=False)  # 缓存1小时，更稳定
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_strategy_signal():
     try:
-        # 1. 获取 QQQ（主数据源）
-        df = yf.Ticker("QQQ").history(period="max", auto_adjust=False, actions=False)[['Close']]
-        df.columns = ['close']
-        df = df.reset_index().rename(columns={'Date': 'date'})
+        # ==================== 1. 一次性下载 QQQ + VIX（最稳健方式） ====================
+        data = yf.download(["QQQ", "^VIX"], start="2010-01-01", progress=False)['Close']
+        data.columns = ['close', 'vix']
+        
+        if len(data) < 300:
+            return {"error": "数据下载不足，请稍后重试（网络波动常见）"}
 
-        if len(df) < 300:
-            return {"error": "QQQ 数据下载不足，请稍后重试"}
+        df = data.reset_index().rename(columns={'Date': 'date'})
 
-        # 2. 获取 VIX 并强制对齐（关键修复）
-        try:
-            vix_series = yf.Ticker("^VIX").history(period="max", auto_adjust=False, actions=False)['Close']
-            # 强制把 VIX 对齐到 QQQ 的日期，并向前填充缺失值
-            vix_series = vix_series.reindex(df['date']).ffill()
-            df['vix'] = vix_series.values
-            vix_ok = True
-        except Exception:
-            # VIX 获取失败时，回退为不使用过滤器
-            df['vix'] = 26.0  # 默认值 >25
-            vix_ok = False
-            st.warning("⚠️ VIX 数据暂时无法获取，已自动关闭 VIX>25 过滤器，策略仍正常运行")
+        # VIX 缺失值向前填充（标准做法）
+        df['vix'] = df['vix'].ffill()
 
-        # 计算指标
+        # ==================== 2. 计算技术指标 ====================
         df['MA200'] = df['close'].rolling(200).mean()
         df['MA50'] = df['close'].rolling(50).mean()
         df['MA20'] = df['close'].rolling(20).mean()
         df['BB_lower'] = df['MA20'] - 2 * df['close'].rolling(20).std()
+
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -48,17 +40,16 @@ def get_strategy_signal():
         if len(df) < 300:
             return {"error": "技术指标计算后数据不足，请稍后重试"}
 
-        # ==================== 策略逻辑（VIX过滤 + 分步止盈） ====================
+        # ==================== 3. 策略核心逻辑 ====================
         cash = 100000.0
         shares = 0.0
         avg_entry = 0.0
         last_buy_price = 0.0
         add_stage = 0
-        sell_stage = 0
+        sell_stage = 0                    # 分步止盈进度
         today_action = "等待"
         today_signal = "gray"
-        position_pct = 0
-        unrealized = 0.0
+        vix_available = True
 
         for i in range(len(df)):
             row = df.iloc[i]
@@ -71,25 +62,22 @@ def get_strategy_signal():
             vix = row['vix']
             current_equity = cash + shares * price
 
-            # 止损
+            # 止损（全仓）
             if shares > 0:
                 if (avg_entry > 0 and price < avg_entry * 0.92) or price < ma200:
                     cash += shares * price
-                    shares = 0.0
-                    avg_entry = 0.0
-                    last_buy_price = 0.0
-                    add_stage = 0
-                    sell_stage = 0
+                    shares = avg_entry = last_buy_price = 0.0
+                    add_stage = sell_stage = 0
                     if i == len(df) - 1:
                         today_action = "🔴 全仓止损"
                         today_signal = "red"
                     continue
 
-            # 分步止盈（30%-30%-40%）
+            # 分步止盈（30% → 30% → 40%）
             if shares > 0:
                 deviate = (price / ma50 - 1) if ma50 > 0 else 0
                 if rsi > 75 or deviate > 0.15:
-                    if sell_stage == 0:
+                    if sell_stage == 0:          # 第一步
                         sell_shares = shares * 0.3
                         cash += sell_shares * price
                         shares -= sell_shares
@@ -97,7 +85,7 @@ def get_strategy_signal():
                         if i == len(df) - 1:
                             today_action = "🔴 分步止盈：卖出30%"
                             today_signal = "red"
-                    elif sell_stage == 1:
+                    elif sell_stage == 1:        # 第二步
                         sell_shares = shares * 0.3
                         cash += sell_shares * price
                         shares -= sell_shares
@@ -105,7 +93,7 @@ def get_strategy_signal():
                         if i == len(df) - 1:
                             today_action = "🔴 分步止盈：卖出30%"
                             today_signal = "red"
-                    elif sell_stage == 2:
+                    elif sell_stage == 2:        # 第三步
                         cash += shares * price
                         shares = 0.0
                         sell_stage = 3
@@ -114,7 +102,7 @@ def get_strategy_signal():
                             today_signal = "red"
                     continue
 
-            # 入场 & 加仓（VIX过滤）
+            # 入场 & 加仓（VIX > 25 过滤）
             trend_ok = price > ma200
             oversold = (rsi <= 40) or (price <= bb_lower)
             vix_filter = vix > 25
@@ -125,8 +113,7 @@ def get_strategy_signal():
                 if buy_amount > 0:
                     shares += buy_amount / price
                     cash -= buy_amount
-                    avg_entry = price
-                    last_buy_price = price
+                    avg_entry = last_buy_price = price
                     add_stage = 1
                     sell_stage = 0
                     if i == len(df) - 1:
@@ -183,12 +170,11 @@ def get_strategy_signal():
             "trend_ok": trend_ok,
             "position_pct": position_pct,
             "unrealized": unrealized,
-            "date": last_row['date'].strftime("%Y-%m-%d"),
-            "vix_available": vix_ok
+            "date": last_row['date'].strftime("%Y-%m-%d")
         }
 
     except Exception as e:
-        return {"error": f"数据获取异常: {str(e)} 请稍后重试"}
+        return {"error": f"数据获取异常: {str(e)} 请稍后重试（网络波动常见）"}
 
 # ==================== 主界面 ====================
 if st.button("🔄 更新最新数据（每日必点）", type="primary", use_container_width=True):
@@ -227,5 +213,5 @@ fig = go.Figure(data=[go.Candlestick(x=hist.index, open=hist['Open'], high=hist[
 fig.update_layout(height=400, template="plotly_dark")
 st.plotly_chart(fig, use_container_width=True)
 
-st.success("✅ 信号灯已就绪！VIX 对齐问题已彻底修复。")
-st.caption("每天点一次「更新最新数据」即可获得今日交易建议")
+st.success("✅ 重构完成！VIX 对齐问题已彻底解决。")
+st.caption("每天点一次按钮即可获得最新交易建议")
